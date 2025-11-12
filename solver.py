@@ -3,6 +3,7 @@ import random
 import sys
 from collections import deque, defaultdict  
 import heapq
+import re  # 添加这一行以导入正则表达式模块
 
 # 设置递归深度以应对大型地图中的可达性搜索
 sys.setrecursionlimit(2000) 
@@ -280,7 +281,9 @@ def find_plan_greedy_nearest(problem_data):
         min_dist = float('inf')
         
         for target in remaining:
-            dist = abs(target[0] - current_pos[0]) + abs(target[1] - current_pos[1])
+            path = find_shortest_path_between(current_pos, target, map_grid)
+            if path is not None:
+                dist = len(path)  # 实际移动步数
             if dist < min_dist:
                 min_dist = dist
                 nearest = target
@@ -423,6 +426,7 @@ def find_shortest_path_with_direction(start_pos, start_dir, goal_pos, map_grid):
     
     return None
 
+
 def find_plan(problem_data):
     """
     主函数: 为FIND_PLAN问题找到解决方案，处理方向不确定性
@@ -446,14 +450,134 @@ def find_plan(problem_data):
                 return plan
         return find_plan_greedy_nearest(problem_data)
     
-    # 多个起始方向：需要鲁棒性更强的策略
-    return find_plan_robust_for_multiple_directions(problem_data)
+    # 多个起始方向：使用迭代扩展策略
+    return find_plan_iterative_extension(problem_data)
 
 
-
-
-def find_plan_robust_for_multiple_directions(problem_data):
+def find_plan_iterative_extension(problem_data):
     """
-    为Problem F设计：使用蚁群算法 (ACO) 生成一个对所有起始方向都鲁棒的计划。
+    迭代扩展策略：先为一个方向生成plan，然后扩展到其他方向
+    复用已有的 find_plan_greedy_nearest 函数
     """
-    
+    map_grid = problem_data['map']
+    start_pos = problem_data['start_pos']
+    all_start_dirs = problem_data['start_dirs']
+    target_spaces = get_reachable_cleanable_spaces(map_grid, start_pos)
+
+    if not target_spaces:
+        return ""
+
+    # 1. 为第一个起始方向生成基础 plan (复用已有函数)
+    first_dir = all_start_dirs[0]
+    # 创建一个临时的problem_data，只有一个起始方向
+    temp_problem_data = {
+        'type': problem_data['type'],
+        'map': problem_data['map'],
+        'start_pos': start_pos,
+        'start_dirs': [first_dir],
+        'plan': problem_data.get('plan', '')  # 如果有plan字段的话
+    }
+    base_plan = find_plan_greedy_nearest(temp_problem_data)
+    current_plan = base_plan if base_plan else ""
+
+    max_iterations = 50
+    iteration = 0
+
+    while iteration < max_iterations:
+        iteration += 1
+        all_good = True
+        missed_spaces_for_any_dir = set()
+
+        # 2. 模拟当前 plan 对所有起始方向的效果
+        for dir in all_start_dirs:
+            visited_by_this_dir = simulate_robot(start_pos, dir, current_plan, map_grid)
+            missed_by_dir = target_spaces - visited_by_this_dir
+            missed_spaces_for_any_dir.update(missed_by_dir)
+            if missed_by_dir:
+                all_good = False
+                print(f"Iteration {iteration}: Plan fails for {dir}, missed {len(missed_by_dir)} spaces.")
+
+        if all_good:
+            print(f"Plan finalized after {iteration} iterations. Total length: {len(current_plan)}")
+            return current_plan
+
+        # 3. 扩展 plan：为失败的方向生成补丁
+        patch_generated = False
+        for dir in all_start_dirs:
+            visited_by_this_dir = simulate_robot(start_pos, dir, current_plan, map_grid)
+            missed_by_dir = target_spaces - visited_by_this_dir
+            if missed_by_dir:
+                # 从该方向的最终状态出发，生成补丁
+                final_pos, final_dir = get_final_state_after_plan(start_pos, dir, current_plan, map_grid)
+                
+                # 创建临时problem_data来复用find_plan_greedy_nearest
+                temp_problem_data_patch = create_problem_data_from_state(
+                    final_pos, final_dir, missed_by_dir, map_grid
+                )
+                
+                patch_plan = find_plan_greedy_nearest(temp_problem_data_patch)
+                
+                if patch_plan:  # 安全检查
+                    current_plan += patch_plan
+                    patch_generated = True
+                    print(f"Extended plan by {len(patch_plan)} steps for direction {dir}")
+                    break  # 生成一个补丁后，重新验证所有方向
+
+        if not patch_generated:
+            # 如果无法生成补丁，使用随机游走作为备选
+            print("No patch generated, adding random walk fallback.")
+            final_pos, final_dir = get_final_state_after_plan(start_pos, all_start_dirs[0], current_plan, map_grid)
+            fallback_plan = generate_random_walk_plan(final_pos, final_dir, map_grid, steps=20)
+            current_plan += fallback_plan if fallback_plan else ""
+            print(f"Added {len(fallback_plan)} random steps as fallback.")
+
+    print(f"Warning: Plan not fully optimized after {max_iterations} iterations. Length: {len(current_plan)}")
+    return current_plan
+
+
+def create_problem_data_from_state(pos, direction, target_spaces, map_grid):
+    """
+    从指定状态创建problem_data，用于复用find_plan_greedy_nearest
+    """
+    # 创建一个虚拟的起始位置（实际上是从pos开始）
+    # 由于find_plan_greedy_nearest需要start_pos和start_dirs，我们创建一个临时的
+    temp_problem_data = {
+        'type': 'FIND_PLAN',  # 假设类型
+        'map': map_grid,
+        'start_pos': pos,  # 起始位置就是当前状态的位置
+        'start_dirs': [direction],  # 起始方向就是当前状态的方向
+    }
+    return temp_problem_data
+
+
+def get_final_state_after_plan(start_pos, start_dir, plan, map_grid):
+    """模拟执行 plan 后的最终状态"""
+    current_pos = start_pos
+    current_dir = start_dir
+    for instruction in plan:
+        if instruction == 'L':
+            current_dir = TURN_LEFT[current_dir]
+        elif instruction == 'R':
+            current_dir = TURN_RIGHT[current_dir]
+        elif instruction == 'M':
+            new_pos = move_with_wrap(current_pos, current_dir, map_grid)
+            if not utils.is_wall(map_grid, new_pos[0], new_pos[1]):
+                current_pos = new_pos
+    return current_pos, current_dir
+
+
+def generate_random_walk_plan(from_pos, from_dir, map_grid, steps=20):
+    """简单的随机游走plan生成器"""
+    plan = ""
+    current_pos = from_pos
+    current_dir = from_dir
+    for _ in range(steps):
+        action = random.choice(['L', 'R', 'M'])
+        plan += action
+        if action == 'L': current_dir = TURN_LEFT[current_dir]
+        elif action == 'R': current_dir = TURN_RIGHT[current_dir]
+        elif action == 'M':
+            new_pos = move_with_wrap(current_pos, current_dir, map_grid)
+            if not utils.is_wall(map_grid, new_pos[0], new_pos[1]):
+                current_pos = new_pos
+    return plan
